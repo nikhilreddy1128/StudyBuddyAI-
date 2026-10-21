@@ -11,8 +11,14 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # Optional hosted account + shared lobby services. Configure as Streamlit secrets or env vars.
-SUPABASE_URL = (os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")).rstrip("/")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY", "")
+def read_optional_secret(name, default=""):
+    try:
+        return os.environ.get(name) or st.secrets.get(name, default)
+    except Exception:
+        return os.environ.get(name, default)
+
+SUPABASE_URL = read_optional_secret("SUPABASE_URL").rstrip("/")
+SUPABASE_ANON_KEY = read_optional_secret("SUPABASE_ANON_KEY")
 SUPABASE_READY = bool(SUPABASE_URL and SUPABASE_ANON_KEY)
 LOCAL_STORE = components.declare_component("studybuddy_local_store", path=str(Path(__file__).parent / "components" / "local_store"))
 _AUTH_KEY = "studybuddy_auth"
