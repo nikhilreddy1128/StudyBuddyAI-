@@ -1,0 +1,34 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body><script>
+(() => {
+  let ready = false, lastIncoming = null, activeKey = "studybuddy_progress_guest", lastSentKey = null;
+  function send(value) {
+    window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:setComponentValue",value}, "*");
+  }
+  window.addEventListener("message", (event) => {
+    const msg = event.data;
+    if (!msg || msg.type !== "streamlit:render") return;
+    const args = msg.args || {};
+    const incoming = args.data_json || "{}";
+    activeKey = args.storage_key || "studybuddy_progress_guest";
+    let stored = null;
+    try { stored = localStorage.getItem(activeKey); } catch(e) {}
+    if (!ready || lastSentKey !== activeKey) {
+      ready = true; lastSentKey = activeKey; lastIncoming = incoming;
+      if (stored) send({source:"browser", data:stored});
+      else {
+        try { localStorage.setItem(activeKey, incoming); } catch(e) {}
+        send({source:"browser", data:incoming});
+      }
+      return;
+    }
+    if (incoming !== lastIncoming) {
+      lastIncoming = incoming;
+      try { localStorage.setItem(activeKey, incoming); } catch(e) {}
+    }
+  });
+  window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:componentReady",apiVersion:1}, "*");
+  window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:setFrameHeight",height:0}, "*");
+})();
+</script></body></html>
