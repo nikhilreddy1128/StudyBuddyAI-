@@ -7,9 +7,63 @@ from pathlib import Path
 
 import requests
 import streamlit as st
+
 import streamlit.components.v1 as components
 
+# Optional hosted account + shared lobby services. Configure as Streamlit secrets or env vars.
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")).rstrip("/")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY", "")
+SUPABASE_READY = bool(SUPABASE_URL and SUPABASE_ANON_KEY)
+LOCAL_STORE = components.declare_component("studybuddy_local_store", path=str(Path(__file__).parent / "components" / "local_store"))
+_AUTH_KEY = "studybuddy_auth"
+
+def _sb_headers(token=None, prefer=None):
+    h = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {token or SUPABASE_ANON_KEY}",
+         "Content-Type": "application/json"}
+    if prefer: h["Prefer"] = prefer
+    return h
+
+def _auth_request(path, payload):
+    r = requests.post(f"{SUPABASE_URL}/auth/v1/{path}", json=payload, headers=_sb_headers(), timeout=20)
+    if r.status_code >= 400:
+        try: msg = r.json().get("msg") or r.json().get("message") or r.json().get("error_description")
+        except Exception: msg = r.text[:250]
+        raise ValueError(msg or "Authentication failed.")
+    return r.json()
+
+def show_auth_gate():
+    # Passwords are sent only to Supabase Auth; never saved in app files.
+    if not SUPABASE_READY or st.session_state.get(_AUTH_KEY, {}).get("access_token"):
+        return True
+    st.markdown("# ✦ StudyBuddyAI")
+    st.caption("Sign in to keep your learning progress separate from other learners.")
+    mode = st.radio("Account", ["Log in", "Create account"], horizontal=True)
+    with st.form("studybuddy_auth_form"):
+        email = st.text_input("Email", placeholder="you@example.com")
+        password = st.text_input("Password", type="password", help="Use at least 8 characters.")
+        submitted = st.form_submit_button("Continue ✦", use_container_width=True)
+    if submitted:
+        try:
+            if not email.strip() or len(password) < 8:
+                raise ValueError("Enter your email and a password with at least 8 characters.")
+            if mode == "Create account":
+                result = _auth_request("signup", {"email": email.strip(), "password": password})
+                if not result.get("access_token"):
+                    st.success("Account created. Check your email if confirmation is enabled, then log in.")
+                    return False
+            else:
+                result = _auth_request("token?grant_type=password", {"email": email.strip(), "password": password})
+            st.session_state[_AUTH_KEY] = result
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not continue: {exc}")
+    st.info("Without Supabase credentials the app runs in local/demo mode. Setup instructions are included in the project.")
+    return False
+
 st.set_page_config(page_title="StudyBuddy AI", page_icon="😄", layout="wide", initial_sidebar_state="expanded")
+
+if not show_auth_gate():
+    st.stop()
 
 DATA = Path(os.environ.get("STUDYBUDDY_DATA_FILE", str(Path(__file__).with_name("study_data.json"))))
 if not DATA.exists() and Path(__file__).with_name("studydaya.json").exists():
@@ -117,6 +171,30 @@ def blank():
     }
 
 def load():
+    auth = st.session_state.get(_AUTH_KEY, {})
+    user_id = auth.get("user", {}).get("id")
+    if SUPABASE_READY and user_id and auth.get("access_token"):
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/learner_progress",
+                params={"user_id": f"eq.{user_id}", "select": "data", "limit": "1"},
+                headers=_sb_headers(auth["access_token"]), timeout=15)
+            r.raise_for_status()
+            rows = r.json()
+            obj = rows[0]["data"] if rows and isinstance(rows[0].get("data"), dict) else blank()
+            had_syllabus = "syllabus" in obj
+            for k, v in blank().items(): obj.setdefault(k, v)
+            defaults = blank()["profile"]
+            if not isinstance(obj.get("profile"), dict): obj["profile"] = defaults.copy()
+            for key, value in defaults.items(): obj["profile"].setdefault(key, value)
+            if not isinstance(obj["profile"].get("greetings"), dict): obj["profile"]["greetings"] = defaults["greetings"].copy()
+            for key, value in defaults["greetings"].items(): obj["profile"]["greetings"].setdefault(key, value)
+            if not had_syllabus: obj["syllabus"] = {k: list(v) for k, v in DEFAULT_TOPICS.items()}
+            if not obj.get("hours") and isinstance(obj.get("study_hours"), dict): obj["hours"] = obj["study_hours"]
+            if not obj.get("results") and isinstance(obj.get("test_results"), list): obj["results"] = obj["test_results"]
+            return obj
+        except Exception as exc:
+            st.error(f"Couldn't load your cloud progress: {exc}")
+            st.stop()
     if DATA.exists():
         try:
             obj = json.loads(DATA.read_text(encoding="utf-8"))
@@ -135,12 +213,40 @@ def load():
             # Migrate older saved files once; an intentionally emptied syllabus stays empty.
             if not had_syllabus:
                 obj["syllabus"] = {k: list(v) for k, v in DEFAULT_TOPICS.items()}
+            if not obj.get("hours") and isinstance(obj.get("study_hours"), dict):
+                obj["hours"] = obj["study_hours"]
+            if not obj.get("results") and isinstance(obj.get("test_results"), list):
+                obj["results"] = obj["test_results"]
             return obj
         except (OSError, json.JSONDecodeError):
             st.warning("Saved data could not be read. The file has not been deleted.")
     return blank()
 
 d = load()
+# Separate local browser progress by signed-in account, or use a guest key in demo mode.
+_auth_user_id = st.session_state.get(_AUTH_KEY, {}).get("user", {}).get("id", "guest")
+_browser_state_key = "studybuddy_browser_progress_" + str(_auth_user_id)
+try:
+    _browser_state = st.session_state.get(_browser_state_key)
+    _local_result = LOCAL_STORE(
+        data_json=json.dumps(_browser_state if isinstance(_browser_state, dict) else d, ensure_ascii=False),
+        storage_key="studybuddy_progress_" + str(_auth_user_id),
+        key="studybuddy_local_store")
+    if st.session_state.get("studybuddy_browser_loaded_key") != _browser_state_key:
+        if isinstance(_local_result, dict) and isinstance(_local_result.get("data"), str):
+            _parsed = json.loads(_local_result["data"])
+            if isinstance(_parsed, dict):
+                d = _parsed
+                st.session_state[_browser_state_key] = d
+                st.session_state["studybuddy_browser_loaded_key"] = _browser_state_key
+        elif isinstance(_browser_state, dict):
+            d = _browser_state
+            st.session_state["studybuddy_browser_loaded_key"] = _browser_state_key
+    elif isinstance(_browser_state, dict):
+        d = _browser_state
+except Exception:
+    # Continue with normal app data if browser storage is unavailable.
+    pass
 # A local demo directory makes the social UI testable on one computer. Real cross-device
 # accounts/chat require a hosted backend; this prototype never pretends these are online users.
 DEMO_PEOPLE = [
@@ -191,7 +297,20 @@ MEDAL_DEFS += [
 
 
 def save():
-    DATA.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+    st.session_state[_browser_state_key] = d
+    auth = st.session_state.get(_AUTH_KEY, {})
+    user_id = auth.get("user", {}).get("id")
+    if SUPABASE_READY and user_id and auth.get("access_token"):
+        try:
+            r = requests.post(f"{SUPABASE_URL}/rest/v1/learner_progress",
+                params={"on_conflict": "user_id"},
+                json={"user_id": user_id, "data": d, "updated_at": datetime.now().astimezone().isoformat()},
+                headers=_sb_headers(auth["access_token"], "resolution=merge-duplicates,return=minimal"), timeout=15)
+            r.raise_for_status()
+        except Exception as exc:
+            st.error(f"Cloud save failed; changes may not be synced: {exc}")
+    else:
+        DATA.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
 
 def medal_for(mistakes):
     return "Gold" if mistakes == 0 else "Silver" if mistakes == 1 else "Bronze" if mistakes in (2, 3) else None
@@ -584,10 +703,14 @@ with st.sidebar:
     st.markdown("# ✦ StudyBuddy")
     st.caption("THE SCHOLAR'S QUEST")
     st.markdown('<span class="pill">LOCAL AI</span><span class="pill">QUEST MODE</span>', unsafe_allow_html=True)
-    page = st.radio("YOUR SPACE", ["Overview", "Syllabus", "Study Journal", "MCQ Arena", "Medal Cabinet", "Scholar Network", "Find Your Mates", "Talk to Your Mates"])
+    page = st.radio("YOUR SPACE", ["Overview", "Syllabus", "Study Journal", "MCQ Arena", "Medal Cabinet", "Scholar Network", "Global Lobby", "Talk to Your Mates"])
     st.markdown("---")
     st.markdown("### 😄 Buddy")
     st.caption("Your study companion is ready.")
+    if SUPABASE_READY and st.session_state.get(_AUTH_KEY, {}).get("access_token"):
+        if st.button("Log out", use_container_width=True):
+            st.session_state.pop(_AUTH_KEY, None)
+            st.rerun()
     components.html("""<div id='buddy' style='font:600 13px system-ui;color:#dce9ff;text-align:center;padding:10px;border:1px solid #66e6f544;border-radius:16px;background:linear-gradient(135deg,#1a2b4c,#151a34)'><div id='face' style='font-size:48px;transition:transform .12s'>😄</div><div id='mood' style='color:#76eaff;margin-top:5px'>READY TO LEARN</div><div style='font-size:11px;color:#9eafd2;margin-top:4px'>Move your pointer around me!</div></div><script>const b=document.getElementById('buddy'),f=document.getElementById('face'),m=document.getElementById('mood');let last=0;b.addEventListener('mousemove',e=>{const r=b.getBoundingClientRect(),x=(e.clientX-r.left)/r.width-.5,y=(e.clientY-r.top)/r.height-.5;f.style.transform=`translate(${x*10}px,${y*7}px) rotate(${x*7}deg)`;m.textContent=x<-.18?'LOOKING LEFT':x>.18?'LOOKING RIGHT':y<-.12?'LOOKING UP':'FOLLOWING YOU'});b.addEventListener('mouseleave',()=>{f.style.transform='';m.textContent='READY TO LEARN'});b.addEventListener('click',()=>{f.textContent='🤩';m.textContent='LET’S GO!';setTimeout(()=>{f.textContent='😄';m.textContent='READY TO LEARN'},1100)});</script>""",height=150, scrolling=False)
 
 if page == "Overview":
@@ -599,9 +722,9 @@ if page == "Overview":
     local_hour = datetime.now(ZoneInfo("Asia/Kolkata")).hour
     time_key = "morning" if 5 <= local_hour < 12 else "afternoon" if 12 <= local_hour < 17 else "evening" if 17 <= local_hour < 21 else "night"
     greeting = (profile.get("greetings", {}).get(time_key) or greeting_defaults[time_key]).strip()
-    display_name = profile.get("name", "").strip() or "Scholar"
+    display_name = profile.get("name", "").strip() or "Learner"
     with st.expander("⚙️ Personalize your Overview", expanded=False):
-        st.caption("Customize your name, time-based greetings and daily focus goal. These settings are saved with this app's data file.")
+        st.caption("Customize your name, time-based greetings and daily focus goal. Your greeting preferences are saved with your progress.")
         with st.form("overview_personalization_form"):
             new_name = st.text_input("Display name", value=profile.get("name", ""), max_chars=40, placeholder="Your name or nickname")
             gc1, gc2 = st.columns(2)
@@ -744,6 +867,25 @@ elif page == "Syllabus":
 
 elif page == "Study Journal":
     hero("BUILD YOUR STREAK","Study journal","Log your focused time and capture what clicked today.")
+    st.caption("The live counter measures active time on this page, not guaranteed focused study time. It pauses while the tab is hidden and stores its count in this browser.")
+    components.html(r"""
+    <div style="font:600 14px system-ui;color:#dce9ff;padding:14px;border:1px solid #66e6f544;border-radius:14px;background:linear-gradient(135deg,#1a2b4c,#151a34)">
+      <div style="color:#76eaff;font-size:11px;letter-spacing:.14em">TODAY'S ACTIVE WEBSITE TIME</div>
+      <div id="sb-timer" style="font-size:26px;margin-top:5px">00:00:00</div>
+      <div style="font-size:11px;color:#aab6d7;margin-top:4px">Saved in this browser · pauses when this tab is hidden</div>
+    </div>
+    <script>
+    (() => {
+      const key='studybuddy_active_seconds_'+new Date().toLocaleDateString('en-CA');
+      let total=Number(localStorage.getItem(key)||0), last=Date.now();
+      const node=document.getElementById('sb-timer');
+      const paint=()=>{const h=Math.floor(total/3600),m=Math.floor(total%3600/60),s=Math.floor(total%60);node.textContent=[h,m,s].map(v=>String(v).padStart(2,'0')).join(':')};
+      const tick=()=>{const now=Date.now();if(!document.hidden)total+=Math.min(5,Math.max(0,(now-last)/1000));last=now;localStorage.setItem(key,String(Math.floor(total)));paint()};
+      document.addEventListener('visibilitychange',()=>{last=Date.now()});
+      paint();setInterval(tick,1000);
+    })();
+    </script>
+    """, height=105, scrolling=False)
     with st.container(border=True):
         hrs=st.number_input("Hours studied today",0.0,24.0,float(d["hours"].get(today,0)),step=.5)
         note=st.text_area("Today's learning note",d["journal"].get(today,""),placeholder="What did you learn? What needs another look?")
@@ -918,47 +1060,49 @@ elif page == "Scholar Network":
             st.markdown("**Can help with:** "+(", ".join(p.get("strong",[])) or "Not specified"))
             st.markdown("**Wants help with:** "+(", ".join(p.get("help",[])) or "Not specified"))
         else: st.caption("Your subject details stay private until you opt in.")
-    st.info("Social features currently use local demo profiles stored beside app.py. To let real people on different devices find each other and chat, the app needs a shared online database and account authentication.")
+    st.info("Scholar Network still includes local demo profiles. Global Lobby is the shared cross-device room when Supabase is configured.")
 
-elif page == "Find Your Mates":
-    hero("FIND YOUR MATES", "Find Your Mates", "Discover study profiles, explore shared subjects, and send a friend request.")
-    current=d["profile"]
-    net=d["network"]
-    if not current.get("name") or not current.get("username"):
-        st.warning("First set your unique display name and username in Scholar Network. Then you can send friend requests.")
-    search=st.text_input("Search people",placeholder="Name, @username, or subject…",key="partner_search")
-    subject_options=sorted({sub for person in net["people"] for sub in person.get("subjects",[])})
-    subject_filter=st.selectbox("Filter by subject",["All subjects"]+subject_options,key="partner_subject_filter")
-    current_username=current.get("username","").casefold()
-    friends=set(net.get("friends",[])); sent=set(net.get("sent",[])); incoming={r.get("username") for r in net.get("incoming",[])}
-    visible=[]
-    for person in net["people"]:
-        if person.get("username","").casefold()==current_username: continue
-        haystack=(person.get("name","")+" "+person.get("username","")+" "+" ".join(person.get("subjects",[]))).casefold()
-        if search.casefold().replace("@","") not in haystack.replace("@",""): continue
-        if subject_filter!="All subjects" and subject_filter not in person.get("subjects",[]): continue
-        visible.append(person)
-    st.caption(f"{len(visible)} profiles discovered · names and usernames are unique in this demo directory")
-    if not visible:
-        st.info("No matching profiles. Try a different name or subject.")
-    for i,person in enumerate(visible):
-        with st.container(border=True):
-            c1,c2=st.columns([4,1])
-            with c1:
-                st.markdown(f"### {person.get('emoji','🌟')} {html.escape(person.get('name','Scholar'))}")
-                st.caption("@"+html.escape(person.get("username","")))
-                st.write(person.get("bio","Ready to study together."))
-                st.markdown(" ".join(f'<span class="pill">{html.escape(x)}</span>' for x in person.get("subjects",[])),unsafe_allow_html=True)
-            with c2:
-                uname=person.get("username","")
-                if uname in friends:
-                    st.success("Friends ✓")
-                elif uname in incoming:
-                    st.info("Request received")
-                elif uname in sent:
-                    st.button("Request sent ✓",key="sent_disabled_"+uname,disabled=True,use_container_width=True)
-                elif st.button("＋ Add friend",key="add_friend_"+uname,use_container_width=True):
-                    net["sent"].append(uname); save(); st.success("Friend request sent!"); st.rerun()
+elif page == "Global Lobby":
+    hero("ONE WORLDWIDE STUDY ROOM", "Global Lobby", "Meet learners in one shared room. Messages show the sender's nickname.")
+    auth = st.session_state.get(_AUTH_KEY, {})
+    token = auth.get("access_token")
+    profile = d.setdefault("profile", {})
+    nickname = st.text_input("Lobby nickname", value=profile.get("name", "").strip() or profile.get("username", "").strip(), max_chars=32, key="lobby_nickname")
+    st.caption("Be kind. Never post passwords, phone numbers, addresses or other private information.")
+    if not SUPABASE_READY:
+        st.warning("The shared Global Lobby needs a Supabase project. Configure SUPABASE_URL and SUPABASE_ANON_KEY, then run SETUP_GLOBAL_LOBBY.sql included with this build.")
+    elif not token:
+        st.info("Log in to join the shared Global Lobby.")
+    else:
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/global_messages",
+                params={"select":"id,nickname,content,created_at","order":"created_at.desc","limit":"80"},
+                headers=_sb_headers(token), timeout=15)
+            r.raise_for_status()
+            messages = list(reversed(r.json()))
+            st.markdown("### 💬 Lobby chat")
+            if not messages: st.caption("You're first — say hello!")
+            for msg in messages:
+                with st.container(border=True):
+                    st.caption(html.escape(str(msg.get("nickname") or "Learner")) + " · " + str(msg.get("created_at",""))[:16].replace("T"," "))
+                    st.markdown(html.escape(str(msg.get("content",""))))
+            with st.form("global_lobby_send", clear_on_submit=True):
+                message = st.text_area("Message everyone", max_chars=500, placeholder="Share a study tip, ask a question, or say hi…")
+                send_message = st.form_submit_button("Send to Global Lobby ↗", use_container_width=True)
+            if send_message:
+                clean_name, clean_message = nickname.strip()[:32], message.strip()
+                if not clean_name or not clean_message:
+                    st.warning("Add a nickname and message first.")
+                else:
+                    post = requests.post(f"{SUPABASE_URL}/rest/v1/global_messages",
+                        json={"nickname":clean_name,"content":clean_message,"user_id":auth.get("user", {}).get("id")},
+                        headers=_sb_headers(token,"return=minimal"), timeout=15)
+                    if post.status_code >= 400: st.error("Message wasn't sent. Check the lobby table permissions.")
+                    else: st.rerun()
+            if st.button("Refresh messages ↻"): st.rerun()
+        except Exception as exc:
+            st.error(f"Couldn't connect to the Global Lobby: {exc}")
+    st.caption("Messages are visible to other signed-in learners when the shared backend is configured.")
 
 elif page == "Talk to Your Mates":
     hero("YOUR STUDY CREW", "Talk to Your Mates", "Friend requests first. Private chats unlock only after a request is accepted.")
